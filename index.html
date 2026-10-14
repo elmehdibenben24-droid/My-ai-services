@@ -1,0 +1,1457 @@
+#!/usr/bin/env node
+/* =============================================================================
+   AI SUBSCRIPTIONS STORE — ONE FILE  (متجر اشتراكات الذكاء الاصطناعي في ملف واحد)
+   Node 20+ · no dependencies · Arabic / French / English
+
+   RUN                node server.js          then open http://localhost:3000
+   CONFIG             put the variables below in a file named .env next to this file
+                      (or set them in your host's dashboard)
+
+   What it does
+     /            store: services and plans, "Subscribe" button, "Open chat / Open workspace" button
+     /login       the customer types the email used to pay and gets a login link
+     /app         "my account": subscribed services; each opens a chat or a work space
+     /api/*       checkout, payment webhook, login, chat, access check
+
+   Edit YOUR SERVICES (section 1) to describe what you sell. Everything else works as is.
+
+   ENVIRONMENT VARIABLES
+     LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_STORE_ID, LEMONSQUEEZY_WEBHOOK_SECRET   payments
+     SESSION_SECRET            long random text (openssl rand -hex 32) — keeps logins valid across restarts
+     SITE_URL                  your public address, e.g. https://store.example.com (no trailing slash)
+     RESEND_API_KEY, MAIL_FROM sends the login email ("Shop <login@your-domain.com>")
+     ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY / your own keyEnv   AI platforms you use
+     UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN   optional shared storage;
+                               without them subscribers are kept in ./data.json (fine for one server)
+     ACCESS_API_SECRET         optional: lets your own backend call GET /api/access?email=...
+     PORT                      default 3000
+
+   TRY IT LOCALLY WITHOUT PAYMENT (never in production)
+     DEV_MODE=1 node server.js
+     curl -X POST localhost:3000/api/dev-grant -H 'Content-Type: application/json' \
+          -d '{"email":"me@example.com","variantId":"REPLACE_WITH_LEMON_SQUEEZY_VARIANT_ID"}'
+     then open /login, type that email: with no Resend key the login link is printed in this terminal.
+   ============================================================================= */
+'use strict';
+
+const http = require('http');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+// ---- optional .env file (KEY=value per line) ----
+(function loadEnv() {
+  try {
+    const file = path.join(process.cwd(), '.env');
+    if (!fs.existsSync(file)) return;
+    fs.readFileSync(file, 'utf8').split(/\r?\n/).forEach((line) => {
+      if (line.trim().startsWith('#')) return;
+      const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+      if (!m) return;
+      let v = m[2];
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+      if (!(m[1] in process.env)) process.env[m[1]] = v;
+    });
+  } catch (e) { /* ignore */ }
+})();
+
+const PORT = Number(process.env.PORT) || 3000;
+const DEV_MODE = process.env.DEV_MODE === '1';
+const IS_PROD = process.env.NODE_ENV === 'production';
+const SITE = () => (process.env.SITE_URL || 'http://localhost:' + PORT).replace(/\/$/, '');
+const SECRET = process.env.SESSION_SECRET || (function () {
+  console.warn('! SESSION_SECRET is not set: using a temporary one, so logins reset on every restart.');
+  return crypto.randomBytes(32).toString('hex');
+})();
+
+/* =============================================================================
+   1. YOUR SERVICES  (خدماتك)
+   CATALOG  is public: names, descriptions, plans, prices, Lemon Squeezy variant ids.
+     mode "chat" = conversation that keeps context · mode "work" = each request runs on its own
+     price here is for display; the amount charged is the one set in Lemon Squeezy.
+   SERVICES is private (never sent to the browser): which AI platform and model each service
+     uses, its secret instructions, answer length and the daily message limit per customer.
+     provider: "anthropic" | "gemini" | "openai-compatible" (OpenAI, DeepSeek, Mistral, Grok, Groq,
+     OpenRouter...; then add "baseUrl" and "keyEnv"). Use the same ids as in CATALOG.
+   ============================================================================= */
+const CATALOG = {
+  "brand": {
+    "ar": "خدماتي الذكية",
+    "fr": "Mes services IA",
+    "en": "My AI Services"
+  },
+  "services": [
+    {
+      "id": "support-bot",
+      "mode": "chat",
+      "name": {
+        "ar": "مساعد خدمة العملاء الذكي",
+        "fr": "Assistant IA du service client",
+        "en": "AI Customer Support Assistant"
+      },
+      "description": {
+        "ar": "بوت محادثة يجيب عن أسئلة عملائك على مدار الساعة بلغة نشاطك.",
+        "fr": "Un chatbot qui répond à vos clients 24h/24 dans la langue de votre activité.",
+        "en": "A chatbot that answers your customers around the clock in your business's language."
+      },
+      "platforms": [
+        "ChatGPT",
+        "Claude",
+        "Gemini"
+      ],
+      "plans": [
+        {
+          "id": "basic",
+          "name": {
+            "ar": "أساسي",
+            "fr": "Essentiel",
+            "en": "Basic"
+          },
+          "price": 19,
+          "currency": "USD",
+          "interval": "month",
+          "variantId": "REPLACE_WITH_LEMON_SQUEEZY_VARIANT_ID",
+          "features": {
+            "ar": [
+              "حتى 1000 محادثة شهرياً",
+              "قاعدة معرفة واحدة"
+            ],
+            "fr": [
+              "Jusqu’à 1000 conversations par mois",
+              "Une base de connaissances"
+            ],
+            "en": [
+              "Up to 1,000 chats per month",
+              "One knowledge base"
+            ]
+          }
+        },
+        {
+          "id": "pro",
+          "name": {
+            "ar": "احترافي",
+            "fr": "Pro",
+            "en": "Pro"
+          },
+          "price": 49,
+          "currency": "USD",
+          "interval": "month",
+          "variantId": "REPLACE_WITH_LEMON_SQUEEZY_VARIANT_ID",
+          "features": {
+            "ar": [
+              "محادثات غير محدودة",
+              "قواعد معرفة متعددة",
+              "تقارير أسبوعية"
+            ],
+            "fr": [
+              "Conversations illimitées",
+              "Plusieurs bases de connaissances",
+              "Rapports hebdomadaires"
+            ],
+            "en": [
+              "Unlimited chats",
+              "Multiple knowledge bases",
+              "Weekly reports"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "content-writer",
+      "mode": "work",
+      "name": {
+        "ar": "مولّد محتوى التسويق",
+        "fr": "Générateur de contenu marketing",
+        "en": "Marketing Content Generator"
+      },
+      "description": {
+        "ar": "أداة تكتب منشورات وإعلانات ورسائل بريدية جاهزة للنشر.",
+        "fr": "Un outil qui rédige posts, publicités et e-mails prêts à publier.",
+        "en": "A tool that writes ready-to-publish posts, ads and emails."
+      },
+      "platforms": [
+        "Claude",
+        "Llama",
+        "Mistral"
+      ],
+      "plans": [
+        {
+          "id": "monthly",
+          "name": {
+            "ar": "شهري",
+            "fr": "Mensuel",
+            "en": "Monthly"
+          },
+          "price": 12,
+          "currency": "USD",
+          "interval": "month",
+          "variantId": "REPLACE_WITH_LEMON_SQUEEZY_VARIANT_ID",
+          "features": {
+            "ar": [
+              "100 نص شهرياً",
+              "قوالب جاهزة"
+            ],
+            "fr": [
+              "100 textes par mois",
+              "Modèles prêts à l’emploi"
+            ],
+            "en": [
+              "100 texts per month",
+              "Ready-made templates"
+            ]
+          }
+        },
+        {
+          "id": "yearly",
+          "name": {
+            "ar": "سنوي",
+            "fr": "Annuel",
+            "en": "Yearly"
+          },
+          "price": 120,
+          "currency": "USD",
+          "interval": "year",
+          "variantId": "REPLACE_WITH_LEMON_SQUEEZY_VARIANT_ID",
+          "features": {
+            "ar": [
+              "نصوص غير محدودة",
+              "قوالب جاهزة",
+              "دعم أولوية"
+            ],
+            "fr": [
+              "Textes illimités",
+              "Modèles prêts à l’emploi",
+              "Support prioritaire"
+            ],
+            "en": [
+              "Unlimited texts",
+              "Ready-made templates",
+              "Priority support"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+};
+
+const SERVICES = {
+  "support-bot": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-5-5",
+    "maxTokens": 1024,
+    "dailyLimit": 60,
+    "system": "You are the customer-support assistant of a business. Answer clearly and politely, in the same language the user writes in (Arabic, French or English). If you do not know something, say so and suggest contacting the business owner. Keep answers short and practical."
+  },
+  "content-writer": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-5-5",
+    "maxTokens": 1500,
+    "dailyLimit": 30,
+    "system": "You are a marketing copywriter. The user describes a product or pastes a text. Produce ready-to-publish copy (post, ad or email) in the language the user writes in. Output only the copy, with no preamble."
+  }
+};
+
+/* =============================================================================
+   2. TRANSLATIONS  (الترجمات)
+   ============================================================================= */
+const I18N = {
+  "ar": {
+    "tagline": "خدمات ذكاء اصطناعي جاهزة بالاشتراك",
+    "sub": "اختر الباقة، ادفع بأمان، وابدأ الاستخدام فوراً.",
+    "subscribe": "اشترك الآن",
+    "redirecting": "جارٍ التحويل إلى الدفع…",
+    "error": "تعذّر بدء الدفع. حاول مرة أخرى.",
+    "notConfigured": "الباقة غير مفعّلة بعد",
+    "perMonth": "شهرياً",
+    "perYear": "سنوياً",
+    "worksWith": "تعمل مع",
+    "loadError": "تعذّر تحميل الخدمات.",
+    "empty": "لا توجد خدمات حالياً.",
+    "thanksTitle": "شكراً لاشتراكك!",
+    "thanksText": "ستصلك رسالة تأكيد على بريدك الإلكتروني خلال دقائق. ادخل إلى حسابك بنفس البريد الذي دفعت به.",
+    "thanksLogin": "ادخل إلى حسابك",
+    "back": "العودة",
+    "login": "تسجيل الدخول",
+    "myAccount": "حسابي",
+    "logout": "خروج",
+    "enterChat": "ادخل للدردشة",
+    "enterWork": "ادخل للعمل",
+    "loginTitle": "تسجيل الدخول إلى حسابك",
+    "loginSub": "اكتب البريد الذي اشتركت به وسنرسل لك رابط دخول.",
+    "emailLabel": "البريد الإلكتروني",
+    "sendLink": "أرسل رابط الدخول",
+    "sending": "جارٍ الإرسال…",
+    "linkSent": "إن كان هذا البريد مشتركاً فستصلك رسالة فيها رابط الدخول. الرابط صالح 15 دقيقة.",
+    "linkInvalid": "الرابط غير صالح أو انتهت مدته. اطلب رابطاً جديداً.",
+    "rateLimited": "محاولات كثيرة. حاول لاحقاً.",
+    "noAccount": "ليس لديك اشتراك؟ تصفّح الخدمات",
+    "myServices": "خدماتي",
+    "noServices": "لا توجد اشتراكات نشطة على هذا البريد.",
+    "goStore": "تصفّح الخدمات",
+    "renews": "يتجدد في",
+    "endsOn": "ينتهي في",
+    "send": "إرسال",
+    "run": "نفّذ",
+    "newChat": "محادثة جديدة",
+    "newTask": "مهمة جديدة",
+    "placeholderChat": "اكتب رسالتك…",
+    "placeholderWork": "ألصق النص أو اكتب المطلوب…",
+    "thinking": "جارٍ التفكير…",
+    "copy": "نسخ",
+    "copied": "تم النسخ",
+    "limitReached": "وصلت إلى الحد اليومي لهذه الخدمة. عُد غداً.",
+    "notSubscribed": "لا تملك اشتراكاً نشطاً في هذه الخدمة.",
+    "sessionExpired": "انتهت الجلسة. سجّل الدخول من جديد.",
+    "genericError": "حدث خطأ. حاول مرة أخرى.",
+    "you": "أنت"
+  },
+  "fr": {
+    "tagline": "Des services d’IA prêts à l’emploi, par abonnement",
+    "sub": "Choisissez une offre, payez en toute sécurité et commencez tout de suite.",
+    "subscribe": "S’abonner",
+    "redirecting": "Redirection vers le paiement…",
+    "error": "Impossible de démarrer le paiement. Réessayez.",
+    "notConfigured": "Offre pas encore activée",
+    "perMonth": "par mois",
+    "perYear": "par an",
+    "worksWith": "Compatible avec",
+    "loadError": "Impossible de charger les offres.",
+    "empty": "Aucune offre pour le moment.",
+    "thanksTitle": "Merci pour votre abonnement !",
+    "thanksText": "Vous recevrez un e-mail de confirmation dans quelques minutes. Connectez-vous avec l’adresse utilisée pour le paiement.",
+    "thanksLogin": "Accéder à mon compte",
+    "back": "Retour",
+    "login": "Se connecter",
+    "myAccount": "Mon compte",
+    "logout": "Déconnexion",
+    "enterChat": "Ouvrir le chat",
+    "enterWork": "Ouvrir l’espace de travail",
+    "loginTitle": "Connectez-vous à votre compte",
+    "loginSub": "Saisissez l’e-mail utilisé pour l’abonnement, nous vous enverrons un lien de connexion.",
+    "emailLabel": "Adresse e-mail",
+    "sendLink": "Envoyer le lien",
+    "sending": "Envoi…",
+    "linkSent": "Si cet e-mail a un abonnement actif, un lien de connexion valable 15 minutes vous a été envoyé.",
+    "linkInvalid": "Lien invalide ou expiré. Demandez-en un nouveau.",
+    "rateLimited": "Trop de tentatives. Réessayez plus tard.",
+    "noAccount": "Pas d’abonnement ? Voir les offres",
+    "myServices": "Mes services",
+    "noServices": "Aucun abonnement actif pour cet e-mail.",
+    "goStore": "Voir les offres",
+    "renews": "Renouvellement le",
+    "endsOn": "Se termine le",
+    "send": "Envoyer",
+    "run": "Exécuter",
+    "newChat": "Nouvelle conversation",
+    "newTask": "Nouvelle tâche",
+    "placeholderChat": "Écrivez votre message…",
+    "placeholderWork": "Collez votre texte ou décrivez la tâche…",
+    "thinking": "Réflexion en cours…",
+    "copy": "Copier",
+    "copied": "Copié",
+    "limitReached": "Limite quotidienne atteinte pour ce service. Revenez demain.",
+    "notSubscribed": "Vous n’avez pas d’abonnement actif pour ce service.",
+    "sessionExpired": "Session expirée. Reconnectez-vous.",
+    "genericError": "Une erreur s’est produite. Réessayez.",
+    "you": "Vous"
+  },
+  "en": {
+    "tagline": "Ready-to-use AI services, by subscription",
+    "sub": "Pick a plan, pay securely, and start right away.",
+    "subscribe": "Subscribe",
+    "redirecting": "Redirecting to checkout…",
+    "error": "Couldn’t start checkout. Please try again.",
+    "notConfigured": "Plan not set up yet",
+    "perMonth": "per month",
+    "perYear": "per year",
+    "worksWith": "Works with",
+    "loadError": "Couldn’t load the plans.",
+    "empty": "No plans available yet.",
+    "thanksTitle": "Thanks for subscribing!",
+    "thanksText": "A confirmation email will reach you in a few minutes. Log in with the same email you paid with.",
+    "thanksLogin": "Go to my account",
+    "back": "Back",
+    "login": "Log in",
+    "myAccount": "My account",
+    "logout": "Log out",
+    "enterChat": "Open chat",
+    "enterWork": "Open workspace",
+    "loginTitle": "Log in to your account",
+    "loginSub": "Enter the email you subscribed with and we’ll send you a login link.",
+    "emailLabel": "Email",
+    "sendLink": "Send login link",
+    "sending": "Sending…",
+    "linkSent": "If this email has an active subscription, a login link is on its way. It works for 15 minutes.",
+    "linkInvalid": "This link is invalid or expired. Request a new one.",
+    "rateLimited": "Too many attempts. Try again later.",
+    "noAccount": "No subscription? Browse the services",
+    "myServices": "My services",
+    "noServices": "No active subscriptions on this email.",
+    "goStore": "Browse services",
+    "renews": "Renews on",
+    "endsOn": "Ends on",
+    "send": "Send",
+    "run": "Run",
+    "newChat": "New chat",
+    "newTask": "New task",
+    "placeholderChat": "Type your message…",
+    "placeholderWork": "Paste your text or describe the task…",
+    "thinking": "Thinking…",
+    "copy": "Copy",
+    "copied": "Copied",
+    "limitReached": "You’ve reached today’s limit for this service. Come back tomorrow.",
+    "notSubscribed": "You don’t have an active subscription to this service.",
+    "sessionExpired": "Session expired. Please log in again.",
+    "genericError": "Something went wrong. Please try again.",
+    "you": "You"
+  }
+};
+
+/* =============================================================================
+   3. STORAGE — Upstash Redis if configured, otherwise a local data.json file
+   ============================================================================= */
+const DATA_FILE = process.env.DATA_FILE || path.join(process.cwd(), 'data.json');
+const LOCAL = { hashes: {}, counters: {} };
+let saveTimer = null;
+
+function loadLocal() {
+  try {
+    const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    LOCAL.hashes = d.hashes || {};
+    LOCAL.counters = d.counters || {};
+    const now = Date.now();
+    Object.keys(LOCAL.counters).forEach((k) => { if (LOCAL.counters[k].exp && LOCAL.counters[k].exp < now) delete LOCAL.counters[k]; });
+  } catch (e) { /* first run */ }
+}
+function persist() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    const tmp = DATA_FILE + '.tmp';
+    fs.writeFile(tmp, JSON.stringify(LOCAL), (err) => { if (!err) fs.rename(tmp, DATA_FILE, () => {}); });
+  }, 200);
+}
+function localRedis(cmd) {
+  const c = cmd[0], k = cmd[1], a = cmd[2], b = cmd[3];
+  if (c === 'HGETALL') { const h = LOCAL.hashes[k]; return h ? [].concat.apply([], Object.entries(h)) : []; }
+  if (c === 'HGET') return (LOCAL.hashes[k] && LOCAL.hashes[k][a]) || null;
+  if (c === 'HSET') { (LOCAL.hashes[k] = LOCAL.hashes[k] || {})[a] = b; persist(); return 1; }
+  if (c === 'INCR') {
+    let e = LOCAL.counters[k];
+    if (!e || (e.exp && e.exp < Date.now())) e = LOCAL.counters[k] = { n: 0, exp: 0 };
+    e.n++; persist(); return e.n;
+  }
+  if (c === 'EXPIRE') { if (LOCAL.counters[k]) LOCAL.counters[k].exp = Date.now() + Number(a) * 1000; persist(); return 1; }
+  throw new Error('unsupported_command');
+}
+
+// redis(['HGET', 'key', 'field']) — same call for Upstash and for the local file
+async function redis(command) {
+  const url = process.env.UPSTASH_REDIS_REST_URL, token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return localRedis(command);
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: JSON.stringify(command)
+  });
+  const data = await r.json();
+  if (!r.ok || data.error) throw new Error('redis_error');
+  return data.result;
+}
+
+/* =============================================================================
+   4. HELPERS — http, subscriptions, signed sessions
+   ============================================================================= */
+function json(res, status, body, headers) {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  Object.keys(headers || {}).forEach((k) => res.setHeader(k, headers[k]));
+  res.end(JSON.stringify(body));
+}
+
+async function rawBody(req, limit) {
+  const max = limit || 1e6;
+  const chunks = [];
+  let size = 0;
+  for await (const c of req) {
+    const buf = typeof c === 'string' ? Buffer.from(c) : c;
+    size += buf.length;
+    if (size > max) throw new Error('too_large');
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
+}
+
+const ACTIVE = new Set(['active', 'on_trial']);
+// A cancelled subscription keeps working until the end of the period the customer already paid for.
+function isActive(sub, now) {
+  if (ACTIVE.has(sub.status)) return true;
+  if (sub.status === 'cancelled' && sub.endsAt) return new Date(sub.endsAt).getTime() > (now || Date.now());
+  return false;
+}
+async function getSubs(email) {
+  const flat = (await redis(['HGETALL', 'sub:' + email])) || [];
+  const subs = [];
+  for (let i = 0; i < flat.length; i += 2) {
+    const rec = JSON.parse(flat[i + 1]);
+    subs.push(Object.assign({ variantId: String(flat[i]) }, rec, { active: isActive(rec) }));
+  }
+  return subs;
+}
+function allVariants() {
+  return new Set(CATALOG.services.flatMap((s) => s.plans.map((p) => String(p.variantId))));
+}
+// Which services does this customer currently have access to?
+function entitlements(subs) {
+  const out = {};
+  CATALOG.services.forEach((svc) => {
+    const variants = new Set(svc.plans.map((p) => String(p.variantId)));
+    const hit = subs.find((s) => variants.has(s.variantId) && s.active);
+    if (hit) out[svc.id] = { status: hit.status, renewsAt: hit.renewsAt, endsAt: hit.endsAt };
+  });
+  return out;
+}
+
+function sign(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  return body + '.' + crypto.createHmac('sha256', SECRET).update(body).digest('base64url');
+}
+function unsign(token) {
+  if (typeof token !== 'string') return null;
+  const i = token.indexOf('.');
+  if (i < 1) return null;
+  const body = token.slice(0, i);
+  const a = Buffer.from(token.slice(i + 1));
+  const b = Buffer.from(crypto.createHmac('sha256', SECRET).update(body).digest('base64url'));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    return p && p.exp && p.exp > Date.now() ? p : null;
+  } catch (e) { return null; }
+}
+function safeEqual(x, y) {
+  const a = Buffer.from(String(x)), b = Buffer.from(String(y));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function parseCookies(req) {
+  const out = {};
+  String(req.headers.cookie || '').split(';').forEach((part) => {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  });
+  return out;
+}
+const SESSION_DAYS = 30;
+const cookieFlags = () => 'Path=/; HttpOnly; SameSite=Lax' + (/^https:/i.test(SITE()) ? '; Secure' : '');
+function sessionCookie(email) {
+  const token = sign({ t: 'session', e: email, exp: Date.now() + SESSION_DAYS * 864e5 });
+  return 'session=' + token + '; ' + cookieFlags() + '; Max-Age=' + SESSION_DAYS * 86400;
+}
+const clearCookie = () => 'session=; ' + cookieFlags() + '; Max-Age=0';
+function getSession(req) {
+  const p = unsign(parseCookies(req).session);
+  return p && p.t === 'session' && p.e ? { email: p.e } : null;
+}
+// Reject browser requests that come from another website.
+function sameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin || !process.env.SITE_URL) return true;
+  try { return new URL(origin).host === new URL(process.env.SITE_URL).host; } catch (e) { return false; }
+}
+
+/* =============================================================================
+   5. AI PLATFORMS — one function for all of them
+   ============================================================================= */
+async function postJson(url, headers, body, ms) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms || 55000);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, headers),
+      body: JSON.stringify(body),
+      signal: ctl.signal
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error('provider_' + r.status);
+    return data;
+  } finally { clearTimeout(timer); }
+}
+function keyFor(cfg, fallbackEnv) {
+  const key = process.env[cfg.keyEnv || fallbackEnv];
+  if (!key) throw new Error('missing_key');
+  return key;
+}
+async function generate(cfg, system, messages) {
+  const maxTokens = cfg.maxTokens || 1024;
+  if (cfg.provider === 'anthropic') {
+    const data = await postJson('https://api.anthropic.com/v1/messages',
+      { 'x-api-key': keyFor(cfg, 'ANTHROPIC_API_KEY'), 'anthropic-version': '2023-06-01' },
+      { model: cfg.model, max_tokens: maxTokens, system, messages });
+    return (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+  }
+  if (cfg.provider === 'gemini') {
+    const data = await postJson(
+      'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(cfg.model) + ':generateContent',
+      { 'x-goog-api-key': keyFor(cfg, 'GEMINI_API_KEY') },
+      {
+        systemInstruction: { parts: [{ text: system }] },
+        contents: messages.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+        generationConfig: { maxOutputTokens: maxTokens }
+      });
+    const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+    return parts.map((p) => p.text || '').join('').trim();
+  }
+  if (cfg.provider === 'openai-compatible') {
+    const base = (cfg.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
+    const body = { model: cfg.model, messages: [{ role: 'system', content: system }].concat(messages) };
+    body[cfg.tokenParam || 'max_tokens'] = maxTokens; // some newer OpenAI models want "max_completion_tokens"
+    const data = await postJson(base + '/chat/completions', { Authorization: 'Bearer ' + keyFor(cfg, 'OPENAI_API_KEY') }, body);
+    const choice = data.choices && data.choices[0];
+    return ((choice && choice.message && choice.message.content) || '').trim();
+  }
+  throw new Error('unknown_provider');
+}
+
+/* =============================================================================
+   6. API
+   ============================================================================= */
+
+// POST /api/checkout {variantId, lang} -> {url}   (creates a Lemon Squeezy checkout)
+async function checkout(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' });
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const variantId = String(body.variantId || '');
+  const lang = ['ar', 'fr', 'en'].includes(body.lang) ? body.lang : 'ar';
+  if (!/^\d+$/.test(variantId) || !allVariants().has(variantId)) return json(res, 400, { error: 'invalid_variant' });
+  const apiKey = process.env.LEMONSQUEEZY_API_KEY, storeId = process.env.LEMONSQUEEZY_STORE_ID;
+  if (!apiKey || !storeId) return json(res, 500, { error: 'server_not_configured' });
+  try {
+    const r = await fetch('https://api.lemonsqueezy.com/v1/checkouts', {
+      method: 'POST',
+      headers: { Accept: 'application/vnd.api+json', 'Content-Type': 'application/vnd.api+json', Authorization: 'Bearer ' + apiKey },
+      body: JSON.stringify({
+        data: {
+          type: 'checkouts',
+          attributes: { product_options: { redirect_url: SITE() + '/thanks' }, checkout_data: { custom: { lang } } },
+          relationships: {
+            store: { data: { type: 'stores', id: String(storeId) } },
+            variant: { data: { type: 'variants', id: variantId } }
+          }
+        }
+      })
+    });
+    const data = await r.json();
+    const url = data && data.data && data.data.attributes && data.data.attributes.url;
+    if (!r.ok || !url) return json(res, 502, { error: 'checkout_failed' });
+    return json(res, 200, { url });
+  } catch (e) { return json(res, 502, { error: 'checkout_failed' }); }
+}
+
+// POST /api/webhook  (Lemon Squeezy tells us about every subscription change; the signature is verified)
+async function webhook(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' });
+  const secret = process.env.LEMONSQUEEZY_WEBHOOK_SECRET;
+  if (!secret) return json(res, 500, { error: 'server_not_configured' });
+
+  const raw = await rawBody(req);
+  const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+  if (!safeEqual(expected, req.headers['x-signature'] || '')) return json(res, 401, { error: 'bad_signature' });
+
+  let payload;
+  try { payload = JSON.parse(raw.toString('utf8')); } catch (e) { return json(res, 400, { error: 'bad_json' }); }
+  const event = payload.meta && payload.meta.event_name;
+  if (!event || !String(event).startsWith('subscription_') || event === 'subscription_payment_success') {
+    return json(res, 200, { ok: true, ignored: true }); // payment events do not change access
+  }
+  const attrs = (payload.data && payload.data.attributes) || {};
+  const email = String(attrs.user_email || '').trim().toLowerCase();
+  const variantId = String(attrs.variant_id || '');
+  if (!email || !variantId) return json(res, 200, { ok: true, ignored: true });
+
+  const record = {
+    subscriptionId: String(payload.data.id), status: attrs.status,
+    renewsAt: attrs.renews_at || null, endsAt: attrs.ends_at || null,
+    updatedAt: attrs.updated_at || new Date().toISOString()
+  };
+  try {
+    const key = 'sub:' + email;
+    const current = await redis(['HGET', key, variantId]); // events can arrive out of order
+    if (current) {
+      const old = JSON.parse(current);
+      if (old.updatedAt && record.updatedAt && new Date(old.updatedAt) > new Date(record.updatedAt)) return json(res, 200, { ok: true, stale: true });
+    }
+    await redis(['HSET', key, variantId, JSON.stringify(record)]);
+    return json(res, 200, { ok: true });
+  } catch (e) { return json(res, 500, { error: 'store_failed' }); } // non-2xx makes Lemon Squeezy retry
+}
+
+// GET /api/access?email=..[&variantId=..]  Authorization: Bearer ACCESS_API_SECRET   (for your own backend)
+async function access(req, res) {
+  if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' });
+  const secret = process.env.ACCESS_API_SECRET;
+  if (!secret) return json(res, 500, { error: 'server_not_configured' });
+  if (!safeEqual(req.headers.authorization || '', 'Bearer ' + secret)) return json(res, 401, { error: 'unauthorized' });
+  const url = new URL(req.url, 'http://localhost');
+  const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
+  const variantId = url.searchParams.get('variantId');
+  if (!email) return json(res, 400, { error: 'email_required' });
+  try {
+    const subs = (await getSubs(email)).map((s) => ({ variantId: s.variantId, status: s.status, renewsAt: s.renewsAt, endsAt: s.endsAt, active: s.active }));
+    const relevant = variantId ? subs.filter((s) => s.variantId === String(variantId)) : subs;
+    return json(res, 200, { active: relevant.some((s) => s.active), subscriptions: relevant });
+  } catch (e) { return json(res, 500, { error: 'lookup_failed' }); }
+}
+
+const MAIL = {
+  ar: { subject: 'رابط الدخول إلى حسابك', intro: 'اضغط على الزر لتسجيل الدخول. الرابط صالح 15 دقيقة.', btn: 'تسجيل الدخول', ignore: 'إن لم تطلب هذا الرابط فتجاهل الرسالة.', dir: 'rtl' },
+  fr: { subject: 'Votre lien de connexion', intro: 'Cliquez sur le bouton pour vous connecter. Le lien est valable 15 minutes.', btn: 'Se connecter', ignore: 'Si vous n’avez pas fait cette demande, ignorez ce message.', dir: 'ltr' },
+  en: { subject: 'Your login link', intro: 'Click the button to log in. The link works for 15 minutes.', btn: 'Log in', ignore: 'If you didn’t request this, you can ignore this email.', dir: 'ltr' }
+};
+async function sendMail(to, subject, html) {
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + process.env.RESEND_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: process.env.MAIL_FROM, to: [to], subject, html })
+  });
+  if (!r.ok) throw new Error('mail_failed');
+}
+
+// POST /api/auth-request {email, lang, next} -> always {ok:true} so nobody can probe who is subscribed
+async function authRequest(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' });
+  if (!sameOrigin(req)) return json(res, 403, { error: 'bad_origin' });
+  const mailReady = process.env.RESEND_API_KEY && process.env.MAIL_FROM;
+  if (!mailReady && IS_PROD) return json(res, 500, { error: 'server_not_configured' });
+
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const email = String(body.email || '').trim().toLowerCase();
+  const lang = MAIL[body.lang] ? body.lang : 'ar';
+  const next = CATALOG.services.some((s) => s.id === body.next) ? body.next : '';
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 200) return json(res, 400, { error: 'bad_email' });
+
+  try {
+    const rl = 'rl:auth:' + email; // at most 5 requests per email per hour
+    const n = await redis(['INCR', rl]);
+    if (n === 1) await redis(['EXPIRE', rl, 3600]);
+    if (n > 5) return json(res, 429, { error: 'rate_limited' });
+
+    const subs = await getSubs(email);
+    if (subs.some((s) => s.active)) {
+      const token = sign({ t: 'login', e: email, next, exp: Date.now() + 15 * 60 * 1000 });
+      const link = SITE() + '/api/auth-verify?token=' + token;
+      if (!mailReady) {
+        console.log('\n[DEV] login link for ' + email + ':\n' + link + '\n');
+      } else {
+        const m = MAIL[lang];
+        await sendMail(email, m.subject,
+          '<div dir="' + m.dir + '" style="font-family:Arial,sans-serif;font-size:16px;line-height:1.6">' +
+          '<p>' + m.intro + '</p><p><a href="' + link + '" style="display:inline-block;background:#2b44c8;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">' + m.btn + '</a></p>' +
+          '<p style="color:#666;font-size:13px">' + m.ignore + '</p></div>');
+      }
+    }
+  } catch (e) {
+    console.error('auth_request_failed', e && e.message);
+    return json(res, 500, { error: 'failed' });
+  }
+  return json(res, 200, { ok: true });
+}
+
+// GET /api/auth-verify?token=..   (the link in the email) -> session cookie, then redirect to /app
+async function authVerify(req, res) {
+  const go = (location, cookie) => {
+    res.statusCode = 302;
+    res.setHeader('Location', location);
+    res.setHeader('Cache-Control', 'no-store');
+    if (cookie) res.setHeader('Set-Cookie', cookie);
+    res.end();
+  };
+  const p = unsign(new URL(req.url, 'http://localhost').searchParams.get('token'));
+  if (!p || p.t !== 'login' || !p.e) return go('/login?error=1');
+  const next = CATALOG.services.some((s) => s.id === p.next) ? '#' + encodeURIComponent(p.next) : '';
+  return go('/app' + next, sessionCookie(p.e));
+}
+
+// GET /api/me -> {email, services:{id:{status,renewsAt,endsAt}}}
+async function me(req, res) {
+  if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' });
+  const session = getSession(req);
+  if (!session) return json(res, 401, { error: 'unauthorized' });
+  try { return json(res, 200, { email: session.email, services: entitlements(await getSubs(session.email)) }); }
+  catch (e) { return json(res, 500, { error: 'lookup_failed' }); }
+}
+
+async function logout(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' });
+  return json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie() });
+}
+
+// POST /api/chat {serviceId, messages:[{role,content}]} -> {reply}
+// Runs only for a logged-in customer with an active subscription to that service.
+async function chat(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' });
+  if (!sameOrigin(req)) return json(res, 403, { error: 'bad_origin' });
+  const session = getSession(req);
+  if (!session) return json(res, 401, { error: 'unauthorized' });
+
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const svc = CATALOG.services.find((s) => s.id === body.serviceId);
+  const cfg = svc && SERVICES[svc.id];
+  if (!svc || !cfg) return json(res, 404, { error: 'unknown_service' });
+
+  let msgs = Array.isArray(body.messages) ? body.messages : [];
+  msgs = msgs
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+    .map((m) => ({ role: m.role, content: m.content.slice(0, 8000) }))
+    .slice(-30);
+  if (svc.mode === 'work') msgs = msgs.slice(-1); // "work" services treat every request on its own
+  while (msgs.length && msgs[0].role !== 'user') msgs.shift();
+  if (!msgs.length || msgs[msgs.length - 1].role !== 'user') return json(res, 400, { error: 'bad_messages' });
+
+  try {
+    if (!entitlements(await getSubs(session.email))[svc.id]) return json(res, 403, { error: 'not_subscribed' });
+    // Daily cap per customer and service, so one account cannot run up your AI bill.
+    const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const key = 'use:' + session.email + ':' + svc.id + ':' + day;
+    const n = await redis(['INCR', key]);
+    if (n === 1) await redis(['EXPIRE', key, 172800]);
+    if (n > (cfg.dailyLimit || 50)) return json(res, 429, { error: 'daily_limit' });
+    const reply = await generate(cfg, cfg.system, msgs);
+    if (!reply) return json(res, 502, { error: 'empty_reply' });
+    return json(res, 200, { reply });
+  } catch (e) {
+    const code = e && e.message;
+    if (code === 'missing_key') return json(res, 500, { error: 'server_not_configured' });
+    console.error('chat_failed', code);
+    return json(res, 502, { error: 'ai_failed' });
+  }
+}
+
+// DEV ONLY (DEV_MODE=1, from this computer only): give an email a test subscription without paying.
+async function devGrant(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' });
+  const ip = String(req.socket.remoteAddress || '');
+  if (!/^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(ip)) return json(res, 403, { error: 'local_only' });
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const email = String(body.email || '').trim().toLowerCase();
+  const variantId = String(body.variantId || '');
+  if (!email || !allVariants().has(variantId)) return json(res, 400, { error: 'bad_request' });
+  await redis(['HSET', 'sub:' + email, variantId, JSON.stringify({ subscriptionId: 'dev', status: 'active', renewsAt: null, endsAt: null, updatedAt: new Date().toISOString() })]);
+  return json(res, 200, { ok: true });
+}
+
+const ROUTES = {
+  '/api/checkout': checkout, '/api/webhook': webhook, '/api/access': access,
+  '/api/auth-request': authRequest, '/api/auth-verify': authVerify,
+  '/api/me': me, '/api/logout': logout, '/api/chat': chat
+};
+if (DEV_MODE) ROUTES['/api/dev-grant'] = devGrant;
+
+/* =============================================================================
+   7. THE WEBSITE — pages, styles and scripts served from memory
+   ============================================================================= */
+const STATIC = {
+  '/': ['text/html; charset=utf-8', String.raw`<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>My AI Services</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=Reem+Kufi:wght@500;600&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" id="brand" href="/"></a>
+      <div class="right">
+        <a class="btn-link" id="acct" href="/login"></a>
+        <div class="langs" role="group" aria-label="Language">
+          <button type="button" data-lang="ar">العربية</button>
+          <button type="button" data-lang="fr">Français</button>
+          <button type="button" data-lang="en">English</button>
+        </div>
+      </div>
+    </header>
+    <section class="hero">
+      <h1 data-i18n="tagline"></h1>
+      <p data-i18n="sub"></p>
+    </section>
+    <main id="catalog" aria-live="polite"></main>
+  </div>
+  <script src="/common.js"></script>
+  <script src="/store.js"></script>
+</body>
+</html>
+`],
+  '/login': ['text/html; charset=utf-8', String.raw`<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=Reem+Kufi:wght@500;600&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" id="brand" href="/"></a>
+      <div class="langs" role="group" aria-label="Language">
+        <button type="button" data-lang="ar">العربية</button>
+        <button type="button" data-lang="fr">Français</button>
+        <button type="button" data-lang="en">English</button>
+      </div>
+    </header>
+    <main class="narrow">
+      <form class="card" id="form" novalidate>
+        <h2 data-i18n="loginTitle"></h2>
+        <p data-i18n="loginSub"></p>
+        <label class="field" for="email"><span data-i18n="emailLabel"></span>
+          <input id="email" type="email" autocomplete="email" inputmode="email" dir="ltr" required>
+        </label>
+        <button class="cta" id="send" type="submit"></button>
+        <p class="msg" id="msg" role="alert"></p>
+        <a href="/" data-i18n="noAccount"></a>
+      </form>
+    </main>
+  </div>
+  <script src="/common.js"></script>
+  <script src="/login.js"></script>
+</body>
+</html>
+`],
+  '/app': ['text/html; charset=utf-8', String.raw`<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>My account</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=Reem+Kufi:wght@500;600&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" id="brand" href="/"></a>
+      <div class="right">
+        <span class="who" id="who"></span>
+        <button class="btn-link" id="logout" type="button" data-i18n="logout"></button>
+        <div class="langs" role="group" aria-label="Language">
+          <button type="button" data-lang="ar">العربية</button>
+          <button type="button" data-lang="fr">Français</button>
+          <button type="button" data-lang="en">English</button>
+        </div>
+      </div>
+    </header>
+    <main id="view" aria-live="polite"></main>
+  </div>
+  <script src="/common.js"></script>
+  <script src="/workspace.js"></script>
+</body>
+</html>
+`],
+  '/thanks': ['text/html; charset=utf-8', String.raw`<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Thanks</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=Reem+Kufi:wght@500;600&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" id="brand" href="/"></a>
+      <div class="langs" role="group" aria-label="Language">
+        <button type="button" data-lang="ar">العربية</button>
+        <button type="button" data-lang="fr">Français</button>
+        <button type="button" data-lang="en">English</button>
+      </div>
+    </header>
+    <main class="center">
+      <h1 class="brand" data-i18n="thanksTitle"></h1>
+      <p data-i18n="thanksText"></p>
+      <a class="cta" href="/login" data-i18n="thanksLogin"></a>
+    </main>
+  </div>
+  <script src="/common.js"></script>
+  <script>
+    Shop.init(function () { document.title = Shop.t('thanksTitle'); });
+  </script>
+</body>
+</html>
+`],
+  '/styles.css': ['text/css; charset=utf-8', String.raw`:root {
+  --bg: #f2f4f8; --surface: #ffffff; --surface-2: #eaeef5; --line: #d8deea;
+  --fg: #0f1830; --muted: #5a6580;
+  --accent: #2b44c8; --accent-fg: #ffffff; --accent-soft: #e3e8fb;
+  --ok: #0b7a4b; --bad: #b3261e; --bad-soft: #f9dedb;
+  --f-display: 'Reem Kufi', 'IBM Plex Sans Arabic', system-ui, sans-serif;
+  --f-body: 'IBM Plex Sans Arabic', system-ui, 'Segoe UI', Tahoma, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0a0f1e; --surface: #121a2f; --surface-2: #1a2440; --line: #26314f;
+    --fg: #e8ecf8; --muted: #9aa6c4;
+    --accent: #8ca0ff; --accent-fg: #0a0f1e; --accent-soft: #1e2a5a;
+    --ok: #5fd3a0; --bad: #ff8f86; --bad-soft: #41191a;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--f-body); font-size: 16px; line-height: 1.65; padding-inline: 16px; }
+.wrap { max-width: 980px; margin-inline: auto; padding-block: 20px 56px; display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+a { color: var(--accent); }
+button, input, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+header { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.brand { font-family: var(--f-display); font-weight: 600; font-size: 24px; color: var(--fg); text-decoration: none; }
+.right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.who { color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+.langs { display: flex; gap: 4px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
+.langs button { border: 0; background: transparent; color: var(--muted); border-radius: 7px; padding: 4px 10px; font-size: 14px; cursor: pointer; }
+.langs button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+.btn-link { border: 1px solid var(--line); background: var(--surface); color: var(--fg); border-radius: 10px; padding: 6px 14px; font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer; display: inline-block; }
+
+.hero { padding-block: 14px 4px; }
+.hero h1 { font-family: var(--f-display); font-weight: 600; font-size: clamp(26px, 5vw, 40px); line-height: 1.3; margin: 0 0 6px; text-wrap: balance; }
+.hero p { margin: 0; color: var(--muted); }
+
+.service, .card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 18px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.service-h { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.service h2, .card h2 { margin: 0; font-size: 20px; font-weight: 600; }
+.service p, .card p { margin: 0; color: var(--muted); }
+.works { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); }
+.chip { background: var(--accent-soft); color: var(--accent); border-radius: 8px; padding: 1px 9px; font-weight: 500; direction: ltr; }
+.plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 12px; }
+.plan { border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 10px; background: var(--bg); min-width: 0; }
+.plan h3 { margin: 0; font-size: 16px; font-weight: 600; }
+.price { font-family: var(--f-display); font-weight: 600; font-size: 30px; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.price small { font-family: var(--f-body); font-size: 14px; font-weight: 400; color: var(--muted); }
+.feats { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; flex: 1; font-size: 15px; }
+.feats li { display: flex; gap: 8px; }
+.feats li::before { content: "\2713"; color: var(--ok); font-weight: 700; }
+
+.cta { border: 0; border-radius: 10px; padding: 10px 16px; font-weight: 600; background: var(--accent); color: var(--accent-fg); cursor: pointer; text-decoration: none; text-align: center; display: inline-block; }
+.cta.ghost { background: var(--accent-soft); color: var(--accent); padding: 7px 14px; font-size: 14px; }
+.cta[disabled] { opacity: .55; cursor: not-allowed; }
+.msg { color: var(--bad); font-size: 14px; min-height: 1px; margin: 0; }
+.ok { color: var(--ok); }
+
+.narrow { max-width: 460px; margin-inline: auto; width: 100%; }
+.field { display: flex; flex-direction: column; gap: 4px; font-weight: 500; }
+.field input { border: 1px solid var(--line); background: var(--surface); border-radius: 10px; padding: 10px 12px; width: 100%; }
+.center { text-align: center; padding-block: 64px; display: flex; flex-direction: column; gap: 14px; align-items: center; }
+
+.row { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.row h2 { margin: 0; font-family: var(--f-display); font-weight: 600; font-size: 24px; }
+.status { font-size: 13px; color: var(--muted); }
+
+.chat { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.msgs { display: flex; flex-direction: column; gap: 10px; min-height: 240px; max-height: 58vh; overflow-y: auto; padding: 4px; }
+.bubble { max-width: 92%; border-radius: 14px; padding: 10px 14px; white-space: pre-wrap; overflow-wrap: anywhere; display: flex; flex-direction: column; gap: 6px; }
+.bubble.user { align-self: flex-start; background: var(--accent); color: var(--accent-fg); }
+.bubble.bot { align-self: flex-end; background: var(--surface); border: 1px solid var(--line); }
+.bubble.bot.wait { color: var(--muted); }
+.bubble .who-l { font-size: 12px; opacity: .75; }
+.bubble button { align-self: flex-start; border: 1px solid var(--line); background: var(--surface-2); border-radius: 8px; padding: 2px 10px; font-size: 13px; cursor: pointer; }
+.composer { display: flex; gap: 8px; align-items: flex-end; }
+.composer textarea { flex: 1; min-width: 0; border: 1px solid var(--line); background: var(--surface); border-radius: 12px; padding: 10px 12px; resize: vertical; min-height: 48px; max-height: 240px; }
+.composer .cta { white-space: nowrap; }
+`],
+  '/common.js': ['application/javascript; charset=utf-8', String.raw`/* Shared helpers: language (ar/fr/en), translations, catalog, tiny DOM builder. */
+(function () {
+  'use strict';
+
+  var LANGS = {
+    ar: { dir: 'rtl', locale: 'ar-MA-u-nu-latn' },
+    fr: { dir: 'ltr', locale: 'fr-MA' },
+    en: { dir: 'ltr', locale: 'en-US' }
+  };
+  var T = null, CATALOG = null, lang = pick(), onLang = null;
+
+  function pick() {
+    try {
+      var saved = localStorage.getItem('lang');
+      if (saved && LANGS[saved]) return saved;
+    } catch (e) {}
+    var nav = (navigator.language || 'ar').slice(0, 2).toLowerCase();
+    return LANGS[nav] ? nav : 'ar';
+  }
+
+  // h('div', {class:'x', text:'hi'}, child1, child2) -> element (text is always set via textContent)
+  function h(tag, attrs) {
+    var el = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) {
+      if (k === 'text') el.textContent = attrs[k];
+      else el.setAttribute(k, attrs[k]);
+    });
+    for (var i = 2; i < arguments.length; i++) if (arguments[i]) el.appendChild(arguments[i]);
+    return el;
+  }
+  function tr(obj) { return (obj && (obj[lang] || obj.en || obj.ar)) || ''; }
+  function t(key) { return (T && T[lang] && T[lang][key]) || ''; }
+
+  function money(plan) {
+    try {
+      return new Intl.NumberFormat(LANGS[lang].locale, { style: 'currency', currency: plan.currency, maximumFractionDigits: 2 }).format(plan.price);
+    } catch (e) { return plan.price + ' ' + plan.currency; }
+  }
+  function date(iso) {
+    try { return new Date(iso).toLocaleDateString(LANGS[lang].locale, { year: 'numeric', month: 'long', day: 'numeric' }); }
+    catch (e) { return iso; }
+  }
+
+  function apply() {
+    document.documentElement.lang = lang;
+    document.documentElement.dir = LANGS[lang].dir;
+    Array.prototype.forEach.call(document.querySelectorAll('[data-i18n]'), function (el) {
+      el.textContent = t(el.getAttribute('data-i18n'));
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('[data-lang]'), function (b) {
+      b.setAttribute('aria-pressed', String(b.getAttribute('data-lang') === lang));
+    });
+    if (CATALOG) {
+      var name = tr(CATALOG.brand), el = document.getElementById('brand');
+      if (el) el.textContent = name;
+      document.title = name;
+    }
+    if (onLang && T && CATALOG) onLang();
+  }
+
+  function setLang(next) {
+    lang = next;
+    try { localStorage.setItem('lang', lang); } catch (e) {}
+    apply();
+  }
+
+  function init(callback) {
+    onLang = callback;
+    Array.prototype.forEach.call(document.querySelectorAll('[data-lang]'), function (b) {
+      b.addEventListener('click', function () { setLang(b.getAttribute('data-lang')); });
+    });
+    Promise.all([
+      fetch('/i18n.json').then(function (r) { return r.json(); }),
+      fetch('/catalog.json').then(function (r) { return r.json(); })
+    ]).then(function (res) { T = res[0]; CATALOG = res[1]; apply(); })
+      .catch(function () {
+        var m = document.querySelector('main');
+        if (m) m.textContent = 'Could not load the store.';
+      });
+  }
+
+  window.Shop = {
+    init: init, h: h, t: t, tr: tr, money: money, date: date, LANGS: LANGS,
+    lang: function () { return lang; },
+    catalog: function () { return CATALOG; }
+  };
+})();
+`],
+  '/store.js': ['application/javascript; charset=utf-8', String.raw`(function () {
+  'use strict';
+  var S = window.Shop, h = S.h, t = S.t, tr = S.tr;
+  var ME = null;
+
+  S.init(render);
+  fetch('/api/me', { credentials: 'same-origin' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (m) { ME = m; render(); })
+    .catch(function () {});
+
+  function render() {
+    var catalog = S.catalog();
+    if (!catalog) return;
+
+    var acct = document.getElementById('acct');
+    acct.setAttribute('href', ME ? '/app' : '/login');
+    acct.textContent = ME ? t('myAccount') : t('login');
+
+    var root = document.getElementById('catalog');
+    root.textContent = '';
+    var wrap = h('div', { style: 'display:flex;flex-direction:column;gap:16px' });
+    if (!catalog.services.length) wrap.appendChild(h('p', { text: t('empty') }));
+    catalog.services.forEach(function (svc) { wrap.appendChild(serviceCard(svc)); });
+    root.appendChild(wrap);
+  }
+
+  function serviceCard(svc) {
+    var enter = h('a', {
+      class: 'cta ghost', href: '/app#' + encodeURIComponent(svc.id),
+      text: t(svc.mode === 'work' ? 'enterWork' : 'enterChat')
+    });
+    var card = h('article', { class: 'service' },
+      h('div', { class: 'service-h' }, h('h2', { text: tr(svc.name) }), enter),
+      h('p', { text: tr(svc.description) })
+    );
+    if (svc.platforms && svc.platforms.length) {
+      var works = h('div', { class: 'works' }, h('span', { text: t('worksWith') }));
+      svc.platforms.forEach(function (p) { works.appendChild(h('span', { class: 'chip', text: p })); });
+      card.appendChild(works);
+    }
+    var plans = h('div', { class: 'plans' });
+    svc.plans.forEach(function (plan) { plans.appendChild(planCard(plan)); });
+    card.appendChild(plans);
+    return card;
+  }
+
+  function planCard(plan) {
+    var ready = /^\d+$/.test(String(plan.variantId));
+    var price = h('div', { class: 'price' }, document.createTextNode(S.money(plan) + ' '),
+      h('small', { text: plan.interval === 'year' ? t('perYear') : t('perMonth') }));
+    var feats = h('ul', { class: 'feats' });
+    (plan.features[S.lang()] || plan.features.en || []).forEach(function (f) { feats.appendChild(h('li', { text: f })); });
+    var msg = h('p', { class: 'msg', role: 'alert' });
+    var btn = h('button', { type: 'button', class: 'cta', text: ready ? t('subscribe') : t('notConfigured') });
+    if (!ready) btn.disabled = true;
+    btn.addEventListener('click', function () { checkout(plan, btn, msg); });
+    return h('div', { class: 'plan' }, h('h3', { text: tr(plan.name) }), price, feats, btn, msg);
+  }
+
+  function checkout(plan, btn, msg) {
+    var label = btn.textContent;
+    btn.disabled = true; btn.textContent = t('redirecting'); msg.textContent = '';
+    fetch('/api/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ variantId: String(plan.variantId), lang: S.lang() })
+    }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (res.ok && res.j.url) { window.location.href = res.j.url; return; }
+        throw new Error('checkout');
+      })
+      .catch(function () { btn.disabled = false; btn.textContent = label; msg.textContent = t('error'); });
+  }
+})();
+`],
+  '/login.js': ['application/javascript; charset=utf-8', String.raw`(function () {
+  'use strict';
+  var S = window.Shop, t = S.t;
+  var params = new URLSearchParams(location.search);
+  var next = params.get('next') || '';
+  var form = document.getElementById('form');
+  var msg = document.getElementById('msg');
+  var send = document.getElementById('send');
+  var state = params.get('error') ? 'invalid' : '';
+
+  S.init(draw);
+
+  function draw() {
+    send.textContent = t('sendLink');
+    if (state === 'invalid') { msg.className = 'msg'; msg.textContent = t('linkInvalid'); }
+    else if (state === 'sent') { msg.className = 'msg ok'; msg.textContent = t('linkSent'); }
+    else if (state === 'limited') { msg.className = 'msg'; msg.textContent = t('rateLimited'); }
+    else if (state === 'error') { msg.className = 'msg'; msg.textContent = t('genericError'); }
+    else msg.textContent = '';
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var email = document.getElementById('email').value.trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { state = 'error'; draw(); return; }
+    send.disabled = true; send.textContent = t('sending'); state = '';
+    fetch('/api/auth-request', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, lang: S.lang(), next: next })
+    }).then(function (r) { state = r.ok ? 'sent' : (r.status === 429 ? 'limited' : 'error'); })
+      .catch(function () { state = 'error'; })
+      .then(function () { send.disabled = false; draw(); });
+  });
+})();
+`],
+  '/workspace.js': ['application/javascript; charset=utf-8', String.raw`(function () {
+  'use strict';
+  var S = window.Shop, h = S.h, t = S.t, tr = S.tr;
+  var ME = null, hist = [], busy = false, err = '';
+  var svcId = currentId();
+
+  function currentId() { return decodeURIComponent(location.hash.replace(/^#/, '')); }
+  function goLogin() { location.href = '/login' + (svcId ? '?next=' + encodeURIComponent(svcId) : ''); }
+
+  window.addEventListener('hashchange', function () { svcId = currentId(); hist = []; err = ''; busy = false; render(); });
+  document.getElementById('logout').addEventListener('click', function () {
+    fetch('/api/logout', { method: 'POST', credentials: 'same-origin' })
+      .catch(function () {})
+      .then(function () { location.href = '/'; });
+  });
+
+  S.init(render);
+  fetch('/api/me', { credentials: 'same-origin' })
+    .then(function (r) { if (r.status === 401) { goLogin(); return null; } return r.json(); })
+    .then(function (m) { if (m) { ME = m; render(); } })
+    .catch(function () { goLogin(); });
+
+  function render() {
+    var catalog = S.catalog();
+    if (!catalog || !ME) return;
+    document.getElementById('who').textContent = ME.email;
+    var view = document.getElementById('view');
+    view.textContent = '';
+    var svc = catalog.services.find(function (s) { return s.id === svcId; });
+    if (svc && ME.services[svc.id]) return renderWorkspace(view, svc);
+    if (svc) {
+      view.appendChild(h('div', { class: 'card' },
+        h('p', { text: t('notSubscribed') }),
+        h('a', { class: 'cta', href: '/', text: t('goStore') })));
+      return;
+    }
+    renderList(view, catalog);
+  }
+
+  function renderList(view, catalog) {
+    var mine = catalog.services.filter(function (s) { return ME.services[s.id]; });
+    view.appendChild(h('div', { class: 'row' }, h('h2', { text: t('myServices') })));
+    var list = h('div', { style: 'display:flex;flex-direction:column;gap:14px;margin-top:14px' });
+    if (!mine.length) {
+      list.appendChild(h('div', { class: 'card' },
+        h('p', { text: t('noServices') }),
+        h('a', { class: 'cta', href: '/', text: t('goStore') })));
+    }
+    mine.forEach(function (svc) {
+      var e = ME.services[svc.id];
+      var line = e.status === 'cancelled' && e.endsAt ? t('endsOn') + ' ' + S.date(e.endsAt)
+        : e.renewsAt ? t('renews') + ' ' + S.date(e.renewsAt) : '';
+      list.appendChild(h('article', { class: 'service' },
+        h('div', { class: 'service-h' }, h('h2', { text: tr(svc.name) }),
+          h('a', { class: 'cta', href: '#' + encodeURIComponent(svc.id), text: t(svc.mode === 'work' ? 'enterWork' : 'enterChat') })),
+        h('p', { text: tr(svc.description) }),
+        line ? h('span', { class: 'status', text: line }) : null));
+    });
+    view.appendChild(list);
+    if (mine.length) view.appendChild(h('p', { style: 'margin-top:14px' }, h('a', { href: '/', text: t('goStore') })));
+  }
+
+  function renderWorkspace(view, svc) {
+    var work = svc.mode === 'work';
+    var msgs = h('div', { class: 'msgs', id: 'msgs' });
+    var ta = h('textarea', { id: 'input', rows: '2', placeholder: t(work ? 'placeholderWork' : 'placeholderChat') });
+    var btn = h('button', { type: 'button', class: 'cta', id: 'go', text: t(work ? 'run' : 'send') });
+    var fresh = h('button', { type: 'button', class: 'btn-link', text: t(work ? 'newTask' : 'newChat') });
+
+    view.appendChild(h('div', { class: 'chat' },
+      h('div', { class: 'row' },
+        h('div', {}, h('a', { href: '#', text: '← ' + t('back') }), h('h2', { text: tr(svc.name) })),
+        fresh),
+      h('div', { class: 'card' }, msgs, h('div', { class: 'composer' }, ta, btn)),
+      h('p', { class: 'msg', id: 'err', role: 'alert' })));
+
+    fresh.addEventListener('click', function () { hist = []; err = ''; drawMsgs(); });
+    btn.addEventListener('click', send);
+    ta.addEventListener('keydown', function (e) {
+      var desktop = window.matchMedia && window.matchMedia('(pointer: fine)').matches;
+      if (e.key === 'Enter' && !e.shiftKey && desktop) { e.preventDefault(); send(); }
+    });
+    drawMsgs();
+    ta.focus();
+  }
+
+  function drawMsgs() {
+    var box = document.getElementById('msgs');
+    if (!box) return;
+    box.textContent = '';
+    hist.forEach(function (m) {
+      var b = h('div', { class: 'bubble ' + (m.role === 'user' ? 'user' : 'bot') },
+        h('span', { class: 'who-l', text: m.role === 'user' ? t('you') : '' }),
+        h('span', { text: m.content }));
+      if (m.role !== 'user') {
+        var c = h('button', { type: 'button', text: t('copy') });
+        c.addEventListener('click', function () { copy(m.content, c); });
+        b.appendChild(c);
+      }
+      box.appendChild(b);
+    });
+    if (busy) box.appendChild(h('div', { class: 'bubble bot wait', text: t('thinking') }));
+    box.scrollTop = box.scrollHeight;
+    var e = document.getElementById('err'); if (e) e.textContent = err;
+    var go = document.getElementById('go'); if (go) go.disabled = busy;
+  }
+
+  function copy(text, btn) {
+    var done = function () { var old = btn.textContent; btn.textContent = t('copied'); setTimeout(function () { btn.textContent = old; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, function () {});
+  }
+
+  function send() {
+    var ta = document.getElementById('input');
+    var text = ta.value.trim();
+    if (!text || busy) return;
+    hist.push({ role: 'user', content: text });
+    ta.value = ''; busy = true; err = ''; drawMsgs();
+
+    fetch('/api/chat', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ serviceId: svcId, messages: hist })
+    }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { status: r.status, j: j }; }); })
+      .then(function (res) {
+        if (res.status === 200 && res.j.reply) { hist.push({ role: 'assistant', content: res.j.reply }); return; }
+        hist.pop(); ta.value = text;               // let the user retry with the same text
+        if (res.status === 401) { err = t('sessionExpired'); setTimeout(goLogin, 1200); }
+        else if (res.status === 403) err = t('notSubscribed');
+        else if (res.status === 429) err = t('limitReached');
+        else err = t('genericError');
+      })
+      .catch(function () { hist.pop(); ta.value = text; err = t('genericError'); })
+      .then(function () { busy = false; drawMsgs(); });
+  }
+})();
+`]
+};
+
+/* =============================================================================
+   8. SERVER
+   ============================================================================= */
+async function onRequest(req, res) {
+  try {
+    const p = new URL(req.url, 'http://localhost').pathname;
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'same-origin');
+
+    if (p.startsWith('/api/')) {
+      const handler = ROUTES[p];
+      if (!handler) return json(res, 404, { error: 'not_found' });
+      if (req.method === 'POST' && p !== '/api/webhook') {
+        const raw = await rawBody(req);
+        try { req.body = raw.length ? JSON.parse(raw.toString('utf8')) : {}; } catch (e) { req.body = {}; }
+      }
+      return await handler(req, res);
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') { res.statusCode = 405; return res.end(); }
+    const file = p === '/catalog.json' ? ['application/json; charset=utf-8', JSON.stringify(CATALOG)]
+      : p === '/i18n.json' ? ['application/json; charset=utf-8', JSON.stringify(I18N)]
+      : STATIC[p === '/index.html' ? '/' : p];
+    if (!file) { res.statusCode = 404; res.setHeader('Content-Type', 'text/plain; charset=utf-8'); return res.end('Not found'); }
+    res.statusCode = 200;
+    res.setHeader('Content-Type', file[0]);
+    res.setHeader('Cache-Control', 'no-cache');
+    return res.end(req.method === 'HEAD' ? '' : file[1]);
+  } catch (e) {
+    console.error('request_failed', e && e.message);
+    if (!res.headersSent) return json(res, e && e.message === 'too_large' ? 413 : 500, { error: 'server_error' });
+    res.end();
+  }
+}
+
+function start(port) {
+  loadLocal();
+  const server = http.createServer(onRequest);
+  server.listen(port, () => {
+    const on = (v) => (process.env[v] ? 'ok' : 'missing');
+    const real = server.address().port;
+    console.log('\nStore running: http://localhost:' + real);
+    console.log('  payments  (LEMONSQUEEZY_*) : ' + (on('LEMONSQUEEZY_API_KEY') === 'ok' && on('LEMONSQUEEZY_WEBHOOK_SECRET') === 'ok' ? 'ok' : 'missing'));
+    console.log('  login mail (RESEND_API_KEY): ' + on('RESEND_API_KEY') + (process.env.RESEND_API_KEY ? '' : ' (login links are printed here)'));
+    console.log('  storage                    : ' + (process.env.UPSTASH_REDIS_REST_URL ? 'Upstash Redis' : 'local file ' + DATA_FILE));
+    console.log('  dev mode                   : ' + (DEV_MODE ? 'ON (do not use in production)' : 'off') + '\n');
+  });
+  return server;
+}
+
+if (require.main === module) start(PORT);
+module.exports = { start, CATALOG, SERVICES };
